@@ -10,6 +10,6 @@ This project follows the traditional approach to building a predictive model for
 
 ### Prediction Goals <br>
 
-- Identifykeypredictorsbybuildingmodelstonotonlyunderstandwhichfactors have the most significant impact on whether it will rain tomorrow but also to accurately predict this outcome.
+- Identify key predictors by building models to not only understand which factors have the most significant impact on whether it will rain tomorrow but also to accurately predict this outcome.
   
-- Assessthepredictivepowerofthemodelsthatusehistoricalweatherdataand consider how much of current local weather forecasts are likely driven by historical patterns versus real-time meteorological insights.
+- Assess the predictive power of themodels that use historical weather data and consider how much of current local weather forecasts are likely driven by historical patterns versus real-time meteorological insights.
