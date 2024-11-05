@@ -1,0 +1,913 @@
+---
+---
+---
+
+## Predicting Precipitation in Australia
+
+------------------------------------------------------------------------
+
+### Context
+
+------------------------------------------------------------------------
+
+Don't let a rainy day surprise you. Utilizing extensive climate data collected daily for nearly 10 years across Australia (2007-2017) we will create a model that will give you a tool to plan for your day.
+
+------------------------------------------------------------------------
+
+#### Data Dictionary
+
+------------------------------------------------------------------------
+
+**Date**: date of observation <br> **Location**: common name of the location of the weather station <br> **MinTemp**: minimum temperature in degrees celsius <br> **MaxTemp**: maximum temperature in degrees celsius <br> **Rainfall**: amount of rainfall recorded for the day in mm <br> **Evaporation**: so-called Class A pan evaporation (mm) in the 24 hours to 9am <br> **Sunshine**: number of hours of bright sunshine in the day. <br> **WindGustDir**: direction of the strongest wind gust in the 24 hours to midnight <br> **WindGustSpeed**: speed (km/h) of the strongest wind gust in the 24 hours to midnight <br> **WindDir9am**: direction of the wind at 9am <br> **WindDir3pm**: direction of the wind at 3pm <br> **WindSpeed9am**: wind speed (km/hr) averaged over 10 minutes prior to 9am <br> **WindSpeed3pm**: wind speed (km/hr) averaged over 10 minutes prior to 3pm <br> **Humidity9am**: humidity (percent) at 9am <br> **Humidity3pm**: humidity (percent) at 3pm <br> **Pressure9am**: atmospheric pressure (hpa) reduced to mean sea level at 9am <br> **Pressure3pm**: atmospheric pressure (hpa) reduced to mean sea level at 3pm <br> **Cloud9am**: fraction of sky obscured by cloud at 9am. This is measured in "oktas", which are a unit of eigths. It records how many eighths of the sky are obscured by cloud. A 0 measure indicates completely clear sky whilst an 8 indicates that it is completely overcast. <br> **Cloud3pm**: fraction of sky obscured by cloud (in "oktas": eighths) at 3pm. <br> **Temp9am**: temperature (degrees C) at 9am <br> **Temp3pm**: temperature (degrees C) at 3pm <br> **RainToday**: Boolean: 1 if precipitation (mm) in the 24 hours to 9am exceeds 1mm, otherwise 0 <br> **RainTomorrow**: amount of next day rain in mm. Used to create response variable RainTomorrow. A kind of measure of the "risk" <br>
+
+------------------------------------------------------------------------
+
+#### Install Libraries
+
+```{r}
+library(readr)
+library(tidyr)
+library(dplyr)
+library(readxl)
+library(ggmap)
+library(ggplot2)
+library(tidygeocoder)
+library(reshape2)
+library(viridisLite)
+library(viridis)
+library(vcd)
+library(corrplot)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(randomForest) 
+```
+
+#### Importing the Data
+
+```{r}
+df <- read.csv("/Users/Beths/Desktop/IST687/weatherAUS.csv")
+```
+
+```{r}
+location_climate <- read_excel("/Users/Beths/Desktop/IST687/PrecipPredict.xlsx", sheet="Location_Climates") 
+
+df <- df %>%
+  left_join(location_climate, by="Location")
+```
+
+#### Data Overview
+
+```{r}
+dim(df)
+```
+
+```{r}
+head(df, n=5)
+```
+
+```{r}
+str(df)
+```
+
+```{r}
+min_Year <- min(df$Year, na.rm=TRUE)
+max_Year<- max(df$Year, na.rm=TRUE)
+
+min_Year
+max_Year
+```
+
+```{r}
+table(df$RainTomorrow)
+```
+
+```{r}
+# Load data and Australia map from map dataset
+test <- read_excel("/Users/Beths/Desktop/IST687/Australian Cities.xlsx")
+aust_map <- map_data("world") %>% filter(region=="Australia")
+
+# Geocode locations to import latitude and longitude 
+ausmap <- test %>%
+  geocode(city, method='osm', lat=latitude , long=longitude)
+
+# Filter for specific lattitue and longitude 
+ausmap <- ausmap %>%
+  filter(latitude<-10 & latitude>-45 & longitude>110 & longitude<155)
+
+# Plot map with weather station locations
+ggplot() +
+  geom_polygon(data=aust_map, aes(x=long, y=lat, group=group), fill="grey") +
+  geom_point(data=ausmap, aes(x=longitude, y=latitude), color="blue", size=1) +
+  labs(title="Weather Monitoring Locations") + coord_map()
+```
+
+```{r}
+avg_rainfall <- df %>%
+  group_by(Location, Year) %>%
+  summarize(avg_rainfall=mean(Rainfall, na.rm=TRUE))
+
+avg_rainfall_location <- avg_rainfall %>%
+  group_by(Location) %>%
+  summarize(avg_rainfall=mean(avg_rainfall))
+
+ausmap <- avg_rainfall_location %>%
+  geocode(Location, method='osm', lat=latitude, long=longitude)
+
+ausmap <- ausmap %>%
+  filter(latitude < -10 & latitude > -45 & longitude > 110 & longitude < 155)
+
+ggplot() +
+  geom_polygon(data=map_data("world") %>% filter(region == "Australia"),
+               aes(x=long, y=lat, group=group), fill= "grey") +
+  geom_point(data=ausmap, aes(x=longitude, y=latitude, size=avg_rainfall, color=avg_rainfall)) +
+  scale_color_gradient(low= "lightgreen", high= "royalblue", name= "Avg Rainfall (mm)") +
+  scale_size_continuous(name= "Avg Rainfall (mm)") +
+  labs(title= "Weather Monitoring Locations - Average Daily Rainfall") +
+  coord_map()
+```
+
+#### Data Preprocessing
+
+```{r}
+uniq_values <- sapply(df, function(x) 
+  length(unique(x)))
+
+uniq_values_df <- data.frame(
+  attribute=names(uniq_values),
+  unique_values=as.integer(uniq_values)
+)
+
+print(uniq_values_df)
+```
+
+```{r}
+uniq_wind <- unique(df$WindGustDir)
+uniq_wind
+```
+
+```{r}
+uniq_cloud <- unique(df$Cloud9am)
+uniq_cloud
+```
+
+```{r}
+uniq_loc <- unique(df$Location)
+uniq_loc
+```
+
+```{r}
+NAs <- sapply(df, function(x) sum(is.na(x)))
+
+NA_count <- data.frame(attribute=names(NAs), total_missing=as.integer(NAs))
+
+NA_count
+```
+
+```{r}
+na_counts <- sapply(df, function(x) sum(is.na(x)))
+na_counts
+```
+
+```{r}
+df <- df[order(df$Date), ]
+
+# Create a new column for actual rainfall tomorrow
+# df$ActualRainfallTomorrow <- c(df$Rainfall[-1], NA)
+
+```
+
+```{r}
+df <- df %>%
+  separate(Date, into=c("Year", "Month", "Day"), sep= "-") %>%
+  mutate(
+    Year=as.numeric(Year),
+    Month=as.numeric(Month),
+    Day=as.numeric(Day)
+  )
+```
+
+```{r}
+df <- df %>% group_by(Location, Month) %>% 
+  mutate(MinTemp=ifelse(is.na(MinTemp), mean(MinTemp, na.rm=TRUE), MinTemp))
+
+df <- df %>% group_by(Location, Month) %>%
+  mutate(MaxTemp=ifelse(is.na(MaxTemp), mean(MaxTemp, na.rm=TRUE), MaxTemp))
+
+df <- df %>% group_by(Location, Month) %>%
+  mutate(Rainfall=ifelse(is.na(Rainfall), mean(Rainfall, na.rm=TRUE), Rainfall))
+
+df <- df %>% group_by(Location, Month) %>%
+  mutate(Evaporation=ifelse(is.na(Evaporation), 
+                              mean(Evaporation, na.rm=TRUE), Evaporation))
+
+df <- df %>% group_by(ClimateClassification, Month) %>%
+  mutate(Evaporation=ifelse(is.na(Evaporation),
+                              mean(Evaporation, na.rm=TRUE), Evaporation))
+
+df <- df %>% group_by(Location, Month) %>%
+  mutate(Sunshine=ifelse(is.na(Sunshine), mean(Sunshine, na.rm=TRUE), Sunshine))
+
+df <- df %>% group_by(RainZones, Month) %>%
+  mutate(Sunshine=ifelse(is.na(Sunshine), mean(Sunshine, na.rm=TRUE), Sunshine))
+
+df <- df %>% group_by(Location, Month) %>%
+  mutate(WindGustSpeed=ifelse(is.na(WindGustSpeed), 
+                                mean(WindGustSpeed, na.rm=TRUE), WindGustSpeed))
+
+df <- df %>% group_by(ClimateClassification, Month) %>%
+  mutate(WindGustSpeed=ifelse(is.na(WindGustSpeed), 
+                                mean(WindGustSpeed, na.rm=TRUE), WindGustSpeed))
+
+df <- df %>% group_by(Location, Month) %>% 
+  mutate(WindSpeed9am=ifelse(is.na(WindSpeed9am), 
+                               mean(WindSpeed9am, na.rm=TRUE), WindSpeed9am))
+
+df <- df %>% group_by(ClimateClassification, Month) %>%
+  mutate(WindSpeed9am=ifelse(is.na(WindSpeed9am), 
+                               mean(WindSpeed9am, na.rm=TRUE), WindSpeed9am))
+
+df <- df %>% group_by(Location, Month) %>%
+  mutate(WindSpeed3pm=ifelse(is.na(WindSpeed3pm), 
+                               mean(WindSpeed3pm, na.rm=TRUE), WindSpeed3pm))
+
+df <- df %>% group_by(ClimateClassification, Month) %>%
+  mutate(WindSpeed3pm=ifelse(is.na(WindSpeed3pm), 
+                               mean(WindSpeed3pm, na.rm= TRUE), WindSpeed3pm))
+
+df <- df %>% group_by(Location, Month) %>%
+  mutate(Humidity9am=ifelse(is.na(Humidity9am), 
+                              mean(Humidity9am, na.rm=TRUE), Humidity9am))
+
+df <- df %>% group_by(RainZones, Month) %>%
+  mutate(Humidity9am=ifelse(is.na(Humidity9am), 
+                              mean(Humidity9am, na.rm=TRUE), Humidity9am))
+
+df <- df %>% group_by(Location, Month) %>%
+  mutate(Humidity3pm=ifelse(is.na(Humidity3pm), 
+                              mean(Humidity3pm, na.rm=TRUE), Humidity3pm))
+
+df <- df %>% group_by(Location, Month) %>%
+  mutate(Pressure9am=ifelse(is.na(Pressure9am), 
+                              mean(Pressure9am, na.rm=TRUE), Pressure9am))
+
+df <- df %>% group_by(RainZones, Month) %>%
+  mutate(Pressure9am=ifelse(is.na(Pressure9am),
+                              mean(Pressure9am, na.rm=TRUE), Pressure9am))
+
+df <- df %>% group_by(Location, Month) %>%
+  mutate(Pressure3pm=ifelse(is.na(Pressure3pm), 
+                             mean(Pressure3pm, na.rm=TRUE), Pressure3pm))
+
+df <- df %>% group_by(RainZones, Month) %>%
+  mutate(Pressure3pm=ifelse(is.na(Pressure3pm), 
+                              mean(Pressure3pm, na.rm=TRUE), Pressure3pm))
+
+df <- df %>% group_by(Location, Month) %>%
+  mutate(Cloud9am=ifelse(is.na(Cloud9am), mean(Cloud9am, na.rm=TRUE), Cloud9am))
+
+df <- df %>% group_by(RainZones, Month) %>%
+  mutate(Cloud9am=ifelse(is.na(Cloud9am), mean(Cloud9am, na.rm=TRUE), Cloud9am))
+
+df <- df %>% group_by(Location, Month) %>%
+  mutate(Cloud3pm=ifelse(is.na(Cloud3pm), mean(Cloud3pm, na.rm=TRUE), Cloud3pm))
+
+df <- df %>% group_by(RainZones, Month) %>%
+  mutate(Cloud3pm=ifelse(is.na(Cloud3pm), mean(Cloud3pm, na.rm=TRUE), Cloud3pm))
+
+df <- df %>% group_by(Location, Month) %>%
+  mutate(Temp9am=ifelse(is.na(Temp9am), mean(Temp9am, na.rm=TRUE), Temp9am))
+
+df <- df %>% group_by(Location, Month) %>%
+  mutate(Temp3pm=ifelse(is.na(Temp3pm), mean(Temp3pm, na.rm=TRUE), Temp3pm))
+```
+
+```{r}
+
+calculate_mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]}
+
+df <- df %>% group_by(Location, Month) %>%
+  mutate(WindGustDir=ifelse(is.na(WindGustDir), calculate_mode(WindGustDir), WindGustDir))
+
+df <- df %>% group_by(ClimateClassification, Month) %>%
+  mutate(WindGustDir=ifelse(is.na(WindGustDir), calculate_mode(WindGustDir), WindGustDir))
+
+df <- df %>% group_by(Location) %>%
+  mutate(WindGustDir=ifelse(is.na(WindGustDir), calculate_mode(WindGustDir), WindGustDir))
+
+df <- df %>% group_by(ClimateClassification, Month) %>%
+  mutate(WindGustDir=ifelse(is.na(WindGustDir), calculate_mode(WindGustDir), WindGustDir))
+
+df <- df %>% group_by(Location, Month) %>%
+  mutate(WindDir9am=ifelse(is.na(WindDir9am), calculate_mode(WindDir9am), WindDir9am))
+
+df <- df %>% group_by(ClimateClassification, Month) %>%
+  mutate(WindDir9am=ifelse(is.na(WindDir9am), calculate_mode(WindDir9am), WindDir9am))
+
+df <- df %>% group_by(Location, Month) %>%
+  mutate(WindDir3pm=ifelse(is.na(WindDir3pm), calculate_mode(WindDir3pm), WindDir3pm))
+
+df <- df %>% group_by(ClimateClassification, Month) %>%
+  mutate(WindDir3pm=ifelse(is.na(WindDir3pm), calculate_mode(WindDir3pm), WindDir3pm))
+```
+
+```{r}
+
+# Drop rows with null values in  RainTomorrow
+df <- df[!is.na(df$RainTomorrow), ]
+
+# Drop rows with null values in  RainToday
+df <- df[!is.na(df$RainToday), ]
+
+```
+
+```{r}
+na_counts <- sapply(df, function(x) sum(is.na(x)))
+na_counts
+```
+
+```{r}
+df <- df %>%
+  filter(Year != 2007 & Year != 2008)
+```
+
+#### Exploratory Data Analysis
+
+##### Univariate
+
+```{r}
+
+# Custom color coding for the Rain Zones
+my_colors <- c("Summer" = "lightgoldenrod",
+               "Summer Dominant" = "palegreen3", 
+               "Uniform" = "turquoise4",
+               "Winter" = "dodgerblue3", 
+               "Winter Dominant" = "navy",
+               "Arid" = "azure4")
+
+# Create a bar plot each RainZone
+ggplot(df, aes(x=RainZones, fill=RainZones)) +
+  geom_bar() +
+  scale_fill_manual(values=my_colors) + theme_minimal() +
+  labs(title="Rain Zone Distribution", 
+       x="Rain Zones", y="Count")
+```
+
+```{r}
+my_colors <- c("Summer Dominant" = "indianred3",
+               "Summer" = "lightgoldenrod", 
+               "Uniform" = "chartreuse4", 
+               "Winter" = "grey54", 
+               "Winter Dominant" = "dodgerblue3",
+               "Arid" = "cornsilk2")
+
+ggplot(df, aes(x=RainZones, fill=RainZones)) +
+  geom_bar() +
+  scale_fill_manual(values=my_colors) +  
+  theme_minimal() +
+  labs(title="Rain Zone Distribution", 
+       x="Rain Zones", 
+       y="Count")
+```
+
+```{r}
+my_colors <- c("Desert" = "tan", 
+               "Grassland" = "chocolate1", 
+               "Subtropical" = "darkseagreen2", 
+               "Temperate" = "deepskyblue1", 
+               "Tropical" = "olivedrab3",
+               "Equatorial" = "goldenrod3")
+# Create a bar plot for RainZones with different colors for each bar
+ggplot(df, aes(x=ClimateClassification, fill=ClimateClassification)) +
+  geom_bar() +                   
+  scale_fill_manual(values=my_colors) +  
+  theme_minimal() +               
+  labs(title="Climate Classification Distribution", 
+       x="ClimateClassification", 
+       y="Count")            
+
+```
+
+```{r}
+
+# Custom color coding for combinations
+my_colors <- c("No_No" = "darkolivegreen", 
+               "No_Yes" = "lightsteelblue4", 
+               "Yes_No" = "cyan4", 
+               "Yes_Yes" = "royalblue")
+
+# Create a bar plot with rain today and tomorrow combinations
+ggplot(df, aes(x=paste(RainToday, RainTomorrow, sep="_"), 
+               fill=paste(RainToday, RainTomorrow, sep= "_"))) +
+  geom_bar() +
+  labs(title="RainToday and RainTomorrow Combinations", 
+       x="RainToday vs RainTomorrow", y="Count") +  
+  scale_fill_manual(values = my_colors) + theme_minimal() 
+```
+
+```{r}
+
+# Create bar chart of rain tomorrow's Yes and No's
+ggplot(df, aes(x=RainTomorrow, fill=RainTomorrow)) +
+  geom_bar() +
+  labs(title="Does it Rain Tomorrow", x="Rain Tomorrow", y="Count") + 
+  scale_fill_manual(values = c("No" = "honeydew3", "Yes" = "lightskyblue3"))
+```
+
+```{r}
+ggplot(df, aes(x = RainToday, fill = RainToday)) +
+  geom_bar() +
+  labs(title="Did it Rain Today", 
+       x="Rain Today", 
+       y="Count") +   
+  scale_fill_manual(values=c("No" = "honeydew3", "Yes" = "lightskyblue3"))
+```
+
+```{r}
+ggplot(df, aes(x=Sunshine)) +
+  geom_histogram(binwidth=.75, fill="darkorange", color="black") +
+  labs(title="Number of Hours of Bright Sunshine in the Day ", 
+       y="Frequency")
+```
+
+```{r}
+
+# Create histogram of minimum temperature
+ggplot(df, aes(x=MinTemp)) +
+  geom_histogram(binwidth=2, fill="lightblue", color="black") +
+  labs(title="Minimum Temperature in degrees Celcius of the Day ", 
+       y="Frequency")
+```
+
+```{r}
+ggplot(df, aes(x=MaxTemp)) +
+  geom_histogram(binwidth=2.5, fill="maroon", color="black") +
+  labs(title="Maximum Temperature in degrees Celcius of the Day ", 
+       y="Frequency")
+```
+
+```{r}
+
+# Create a histogram of rainfall 
+ggplot(df, aes(x=Rainfall)) +
+  geom_histogram(binwidth=18, fill="lightsteelblue", color="black") +
+  labs(title="Rainfall (mm) per day", y="Frequency")
+```
+
+```{r}
+
+# Create a boxplot of rainfall 
+ggplot(df, aes(x=Rainfall)) +
+  geom_boxplot(fill="lightsteelblue", color="darkblue") +
+  labs(title="Boxplot: Rainfall (mm) per day", x="Rainfall (mm)") 
+```
+
+```{r}
+rain_outliers <- df[order(-df$Rainfall), ][1:20, ]
+rain_outliers
+```
+
+```{r}
+df <- df[df$Rainfall <= 200, ]
+```
+
+```{r}
+ggplot(df, aes(x=Rainfall)) +
+  geom_histogram(binwidth =10, fill="lightsteelblue", color="black") +
+  labs(title="Rainfall (mm) per day", 
+       y="Frequency")
+```
+
+```{r}
+ggplot(df, aes(x=Evaporation)) +
+  geom_histogram(binwidth =5, fill="khaki", color="black") +
+  labs(title="Evaporation (mm) in a 24 hours", 
+       y="Frequency")
+```
+
+```{r}
+ggplot(df, aes(x = Evaporation)) +
+  geom_boxplot(fill="lightsteelblue", color="darkblue") +
+  labs(title="Boxplot: Evaporation (mm) per day", x = "Evaporation (mm)") 
+```
+
+```{r}
+evap_outliers <- df[order(-df$Evaporation), ][1:20, ]
+evap_outliers
+```
+
+```{r}
+df <- df[df$Evaporation <= 69, ]
+```
+
+```{r}
+ggplot(df, aes(x=Evaporation)) +
+  geom_histogram(binwidth =4, fill="khaki", color="black") +
+  labs(title="Evaporation (mm) in a 24 hours", 
+       y="Frequency")
+```
+
+```{r}
+rainzone_ave_rain <- df %>% group_by(RainZones, Year) %>%
+  summarise(ave_rain=mean(Rainfall, na.rm=TRUE), .groups="drop")
+
+ggplot(rainzone_ave_rain, aes(x=Year, y=ave_rain, color=RainZones, group=RainZones)) +
+  geom_line(size=1) +
+  labs(title="Average Daily Rainfall by Rain Zone and Year",
+       x="Year", y="Average Rainfall (mm)", color="Rain Zone") +
+      scale_x_continuous(breaks=seq(2007, 2017, by=1)) +
+      theme_minimal() +
+      scale_color_manual(values = c("Summer Dominant" = "indianred3",
+               "Summer" = "lightgoldenrod", 
+               "Uniform" = "chartreuse4", 
+               "Winter" = "grey54", 
+               "Winter Dominant" = "dodgerblue3",
+               "Arid" = "cornsilk3"))
+```
+
+```{r}
+
+# Calculate average daily rainfall
+rainzone_ave_rain <- df %>% group_by(RainZones, Year) %>%
+  summarise(ave_rain=mean(Rainfall, na.rm=TRUE), .groups="drop")
+
+# Create line plot of average daily rainfall by rain zone
+ggplot(rainzone_ave_rain, aes(x=Year, y=ave_rain, color=RainZones, group=RainZones)) +
+  geom_line(size=1) +
+  labs(title="Average Daily Rainfall by Rain Zone and Year",
+       x="Year", y="Average Rainfall (mm)", color="Rain Zone") +
+      scale_x_continuous(breaks=seq(2007, 2017, by=1)) +
+      scale_color_manual(values=c("Summer" = "lightgoldenrod", 
+                                  "Summer Dominant" = "palegreen3", 
+                                  "Uniform" = "turquoise4",
+                                  "Winter" = "dodgerblue3", 
+                                  "Winter Dominant" = "navy", 
+                                  "Arid" = "azure4"))
+```
+
+```{r}
+rainzone_ave_rain <- df %>% 
+  group_by(RainZones, Year) %>%
+  summarise(total_rain=sum(Rainfall, na.rm=TRUE), .groups="drop")
+
+ggplot(rainzone_ave_rain, aes(x=Year, y=total_rain, color=RainZones, group=RainZones)) +
+  geom_line(size=1) +
+  labs(title="Total Annual Rainfall by Rain Zone and Year",
+       x="Year", y="Total Rainfall (mm)", color="Rain Zone") +
+      scale_x_continuous(breaks=seq(2007, 2017, by = 1)) +
+      scale_color_manual(values = c("Summer" = "lightgoldenrod", "Summer Dominant" = "palegreen3", 
+                                    "Uniform" = "turquoise4", "Winter" = "dodgerblue3", 
+                                    "Winter Dominant" = "navy", "Arid" = "azure4"))
+```
+
+```{r}
+climate_ave_rain <- df %>% group_by(ClimateClassification, Year) %>%
+  summarise(ave_rain=mean(Rainfall, na.rm=TRUE), .groups="drop")
+
+ggplot(climate_ave_rain, aes(x=Year, y=ave_rain, color=ClimateClassification, group= ClimateClassification)) +
+  geom_line(size=1) +
+  labs(title="Average Daily Rainfall by Climate Classification and Year",
+      x="Year", y="Average Rainfall (mm)", color="Climate") +
+      scale_x_continuous(breaks=seq(2007, 2017, by=1)) +
+      scale_color_manual(values=c("Desert" = "tan", "Grassland" = "gold2", 
+                                    "Subtropical" = "lightseagreen",
+                                    "Temperate" = "forestgreen", "Equatorial" = "steelblue",
+                                    "Tropical" = "maroon"))
+```
+
+```{r}
+climate_ave_rain <- df %>%
+  group_by(ClimateClassification, Year) %>%
+  summarise(total_rain = sum(Rainfall, na.rm = TRUE), .groups = "drop")
+
+ggplot(climate_ave_rain, aes(x=Year, y=total_rain, color=ClimateClassification, group= ClimateClassification)) +
+  geom_line(size=1) +
+  labs(title="Total Annual Rainfall by Climate Classification and Year",
+       x="Year", y="Total Rainfall (mm)", color="Climate") +
+  scale_x_continuous(breaks=seq(2007, 2017, by=1)) +
+  scale_color_manual(values=c("Desert" = "tan", "Grassland" = "gold2", 
+                                    "Subtropical" = "lightseagreen",
+                                    "Temperate" = "forestgreen", "Equatorial" = "steelblue",
+                                    "Tropical" = "maroon"))
+```
+
+```{r}
+
+# Filter for the years 2008 through 2009
+df_2007_2009 <- df %>%
+  filter(Year %in% c(2008, 2009))
+
+# Group by RainZones, Year, and Month, by average rainfall 
+monthly_rainzone_ave_rain <- df_2007_2009 %>%
+  group_by(RainZones, Year, Month) %>%
+  summarise(ave_rain = mean(Rainfall, na.rm=TRUE), .groups="drop")
+
+# Custom color coding for the Rain Zones
+my_colors <- c("Summer" = "lightgoldenrod", 
+               "Summer Dominant" = "palegreen3", 
+               "Uniform" = "turquoise4", 
+               "Winter" = "dodgerblue3", 
+               "Winter Dominant" = "navy",
+               "Arid" = "azure4")
+
+# Create a line plot showing average rainfall by rain zones 
+ggplot(monthly_rainzone_ave_rain, aes(x=Month, y=ave_rain, color=RainZones, group=RainZones)) +
+  geom_line(size=1) +  facet_wrap(~ Year) +  
+  labs(title="Average Monthly Rainfall by Rain Zones (2008-2009)",
+       x="Month", y="Average Rainfall (mm)", color="Rain Zones") +
+  scale_x_continuous(breaks=1:12, labels=month.abb) + 
+  scale_color_manual(values=my_colors) +  
+  theme_minimal() +  theme(axis.text.x=element_text(angle=45, hjust=1))
+```
+
+```{r}
+climate_ave_humid <- df %>% group_by(RainZones, Year) %>%
+  summarise(ave_humid=mean(AveHumidity, na.rm=TRUE), .groups="drop")
+
+ggplot(climate_ave_humid, aes(x=Year, y=ave_humid, color=RainZones, group=RainZones)) +
+  geom_line(size=1) +
+  labs(title="Average Daily Humidity by Rain Zone and Year",
+      x="Year", y="Average Humidity (%)", color="Rain Zone") +
+      scale_x_continuous(breaks=seq(2007, 2017, by=1)) +
+      scale_color_manual(values=c("Summer" = "lightgoldenrod", 
+                                    "Summer Dominant" = "palegreen3", 
+                                    "Uniform" = "turquoise4", "Winter" = "dodgerblue3", 
+                                    "Winter Dominant" = "navy", "Arid" = "azure4"))
+```
+
+```{r}
+climate_ave_press <- df %>% group_by(RainZones, Year) %>%
+  summarise(ave_press=mean(AvePressure, na.rm=TRUE), .groups="drop")
+
+ggplot(climate_ave_press, aes(x=Year, y=ave_press, color=RainZones, group=RainZones)) +
+  geom_line(size=1) +
+  labs(title="Average Daily Pressure by Rain Zone and Year",
+      x="Year", y="Average Pressure (hpa)", color="Rain Zone") +
+      scale_x_continuous(breaks=seq(2007, 2017, by=1)) +
+      scale_color_manual(values=c("Summer" = "lightgoldenrod", 
+                                    "Summer Dominant" = "palegreen3", 
+                                    "Uniform" = "turquoise4", "Winter" = "dodgerblue3", 
+                                    "Winter Dominant" = "navy", "Arid" = "azure4"))
+```
+
+```{r}
+ave_pressure <- rowMeans(df[, c("Pressure9am", "Pressure3pm")], na.rm = TRUE)
+
+# Add the average pressure to the dataset
+df$ave_pressure <- ave_pressure
+
+# Create a boxplot with custom colors for RainTomorrow
+ggplot(df, aes(x=RainTomorrow, y=ave_pressure, fill=RainTomorrow)) +
+  geom_boxplot() +
+  labs(title="Average Daily Pressure by Rain Tomorrow",
+       x="Rain Tomorrow", y="Average Pressure") +
+  scale_fill_manual(values=c("No" = "honeydew3", "Yes" = "lightskyblue3")) 
+```
+
+```{r}
+#df$ave_humidity <- ave_humidity
+
+# Calculate average humidity
+ave_humidity <- rowMeans(df[, c("Humidity9am", "Humidity3pm")], na.rm=TRUE)
+
+# Create a boxplot for humdity by rain tomorrow
+ggplot(df, aes(x=RainTomorrow, y=ave_humidity, fill=RainTomorrow)) +
+  geom_boxplot() +
+  labs(title="Average Daily Humidity by Rain Tomorrow",
+       x="Rain Tomorrow", y="Average Humidity") +
+  scale_fill_manual(values=c("No"="honeydew3", "Yes"="lightskyblue3"))
+```
+
+```{r}
+#, -ActualRainfallTomorrow
+df <- df %>% ungroup()
+df <- df %>% select(-Location, -ClimateClassification)
+```
+
+```{r}
+df <- df %>%
+  mutate(AveWindSpeed=(WindSpeed9am + WindSpeed3pm) / 2)
+df <- df %>%
+  mutate(AveHumidity=(Humidity9am + Humidity3pm) / 2)
+df <- df %>%
+  mutate(AvePressure=(Pressure9am + Pressure3pm) / 2)
+df <- df %>%
+  mutate(AveCloud=(Cloud9am + Cloud3pm) / 2)
+```
+
+```{r}
+df <- df %>% select(-WindSpeed9am, -WindSpeed3pm, -Humidity9am, -Humidity3pm, -Pressure9am, -Pressure3pm, -Cloud9am, -Cloud3pm, -Temp9am, -Temp3pm, -WindDir9am, -WindDir3pm)
+```
+
+```{r}
+str(df)
+```
+
+```{r}
+# Select for numerical variables
+num_df <- df[, sapply(df, is.numeric)]
+
+# Compute and melt into long format
+cor_matrix <- cor(num_df, use="complete.obs")
+melted_cor_matrix <- melt(cor_matrix)
+
+# Create the heatmap with correlation values
+ggplot(melted_cor_matrix, aes(x=Var1, y=Var2, fill=value)) +
+  geom_tile(color="white") +
+  scale_fill_viridis(option="C", name="Correlation", limits=c(-1, 1)) +
+  #geom_text(aes(label=round(value, 2)), color="black", size=3) +
+  labs(title="Correlation Heatmap of Numerical Variables",
+       x=NULL, y=NULL) + theme_minimal() +
+  theme(axis.text.x=element_text(angle=45, vjust=1, hjust=1),
+        axis.text.y=element_text(angle=0, vjust=1, hjust=1))
+```
+
+```{r}
+
+# Select for categorical variables
+cat_vars <- c("WindGustDir", "RainToday", "RainTomorrow", "RainZones")
+
+# Define function for Cramer's V 
+cramer_v <- function(x, y) {
+  tbl <- table(x, y)
+  chisq <- chisq.test(tbl, correct=FALSE)
+  n <- sum(tbl)
+  return(sqrt(chisq$statistic / (n*(min(dim(tbl))-1))))
+}
+# Compute for all variables
+cramer_matrix <- matrix(NA, nrow=ength(cat_vars), ncol=length(cat_vars),
+                        dimnames=list(cat_vars, cat_vars))
+for (i in 1:length(cat_vars)) {
+  for (j in i:length(cat_vars)) {
+    cramer_matrix[i, j] <- cramer_v(df[[cat_vars[i]]], df[[cat_vars[j]]])
+  }
+}
+diag(cramer_matrix) <- 1
+cramer_matrix[is.na(cramer_matrix)] <- 0
+
+# Plot the heatmap
+corrplot(cramer_matrix, method = "color", addCoef.col= "black",  
+         tl.col= "black", tl.srt= 45,            
+         title= "Cramér's V Heatmap of Categorical Variables", 
+         mar= c(0, 0, 2, 0))
+    
+```
+
+```{r}
+df$RainTomorrow <- as.factor(df$RainTomorrow)
+```
+
+```{r}
+# Set uniform sampling and randomly sample for training dataset
+set.seed(88)
+trainList <- createDataPartition(
+                y=df$RainTomorrow, p=0.70, list=FALSE)
+# Create a training and testing dataset
+train_df <- df[trainList,]
+test_df <- df[-trainList,]
+```
+
+```{r}
+
+svm.model <- train(RainTomorrow ~ ., data=train_df, method="svmRadial",
+                   trControl=trainControl(method="none"), preProcess= c("center", "scale"))
+
+svm.model
+```
+
+```{r}
+summary(svm.model)
+```
+
+```{r}
+predictValues <- predict(svm.model, newdata=test_df)
+confusionMatrix(predictValues, test_df$RainTomorrow)
+```
+
+```{r}
+trctrl <- trainControl(method="repeatedcv", number=10)
+svm.model.kfold <- train(RainTomorrow ~ ., data=train_df, method="svmRadial",
+                         trControl=trctrl, preProcess=c("center", "scale"))
+svm.model.kfold
+```
+
+```{r}
+predictValKfold <- predict(svm.model.kfold,newdata=test_df)
+confusionMatrix(predictValKfold, test_df$RainTomorrow)
+```
+
+```{r}
+svm.model.kfold$finalModel@nSV
+```
+
+```{r}
+hist(svm.model$finalModel@alpha[[1]], main="Histogram of Alpha")
+```
+
+```{r}
+model.rpart <- train(RainTomorrow ~ ., method="rpart", data=train_df, trControl=trctrl,
+                     tuneLength=50)
+model.rpart
+```
+
+```{r}
+predictValRpart <- predict(model.rpart, newdata=test_df)
+
+confusionMatrix(predictValRpart, test_df$RainTomorrow)
+```
+
+```{r}
+rpart.plot(model.rpart$finalModel)
+```
+
+```{r}
+
+# Determine the important variables
+varImp(model.rpart)
+```
+
+```{r}
+model.rpart2 <- train(RainTomorrow ~ AveHumidity + Rainfall, method="rpart", 
+                     data=train_df, trControl=trctrl, tuneLength=10)
+model.rpart2
+```
+
+```{r}
+
+predictValRpart2 <- predict(model.rpart2, newdata=test_df)
+
+confusionMatrix(predictValRpart2, test_df$RainTomorrow)
+```
+
+```{r}
+rpart.plot(model.rpart2$finalModel)
+```
+
+```{r}
+set.seed(88)
+model_rf <- randomForest(RainTomorrow ~ ., data = train_df, importance=TRUE, ntree=500)
+model_rf
+```
+
+```{r}
+predictValRf <- predict(model_rf, newdata=test_df)
+
+confusionMatrix(predictValRf, test_df$RainTomorrow)
+```
+
+```{r}
+
+# Determine the important variables
+varImpPlot(model_rf)
+```
+
+```{r}
+# SVM Model
+svm_accuracy <- confusionMatrix(predictValues, test_df$RainTomorrow)$overall['Accuracy']
+svm_precision <- confusionMatrix(predictValues, test_df$RainTomorrow)$byClass['Pos Pred Value']
+svm_recall <- confusionMatrix(predictValues, test_df$RainTomorrow)$byClass['Sensitivity']
+svm_f1 <- (2 * svm_precision * svm_recall) / (svm_precision + svm_recall)
+
+# SVM with Kfold
+svm_k_accuracy <- confusionMatrix(predictValKfold, test_df$RainTomorrow)$overall['Accuracy']
+svm_k_precision <- confusionMatrix(predictValKfold, test_df$RainTomorrow)$byClass['Pos Pred Value']
+svm_k_recall <- confusionMatrix(predictValKfold, test_df$RainTomorrow)$byClass['Sensitivity']
+svm_k_f1 <- (2 * svm_k_precision * svm_k_recall) / (svm_k_precision + svm_k_recall)
+
+# rpart Model
+rpart_accuracy <- confusionMatrix(predictValRpart, test_df$RainTomorrow)$overall['Accuracy']
+rpart_precision <- confusionMatrix(predictValRpart, test_df$RainTomorrow)$byClass['Pos Pred Value']
+rpart_recall <- confusionMatrix(predictValRpart, test_df$RainTomorrow)$byClass['Sensitivity']
+rpart_f1 <- (2 * rpart_precision * rpart_recall) / (rpart_precision + rpart_recall)
+
+# rpart Model2 abridged
+rpart2_accuracy <- confusionMatrix(predictValRpart2, test_df$RainTomorrow)$overall['Accuracy']
+rpart2_precision <- confusionMatrix(predictValRpart2, test_df$RainTomorrow)$byClass['Pos Pred Value']
+rpart2_recall <- confusionMatrix(predictValRpart2, test_df$RainTomorrow)$byClass['Sensitivity']
+rpart2_f1 <- (2 * rpart2_precision * rpart2_recall) / (rpart2_precision + rpart2_recall)
+
+# Random Forest Model
+rf_accuracy <- confusionMatrix(predictValRf, test_df$RainTomorrow)$overall['Accuracy']
+rf_precision <- confusionMatrix(predictValRf, test_df$RainTomorrow)$byClass['Pos Pred Value']
+rf_recall <- confusionMatrix(predictValRf, test_df$RainTomorrow)$byClass['Sensitivity']
+rf_f1 <- (2 * rf_precision * rf_recall) / (rf_precision + rf_recall)
+
+# Combine all metrics into one data frame
+combined_metrics_df <- data.frame(
+  Model=c("SVM", "SVM with Kfold", "RPart", "RPart2", "RandomForest"),
+  Accuracy=c(svm_accuracy, svm_k_accuracy, rpart_accuracy, rpart2_accuracy, rf_accuracy),
+  Precision=c(svm_precision, svm_k_precision, rpart_precision, rpart2_precision, rf_precision),
+  Recall=c(svm_recall, svm_k_recall, rpart_recall, rpart2_recall, rf_recall),
+  F1_Score=c(svm_f1, svm_k_f1, rpart_f1, rpart2_f1, rf_f1)
+)
+
+# Print the combined data frame
+print(combined_metrics_df)
+
+```
+
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
